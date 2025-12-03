@@ -4,8 +4,22 @@ A Python library for interfacing with NiimBot B1 thermal label printers via Blue
 
 ## Installation
 
+You can install this library directly from the source:
+
 ```bash
-pip install -r requirements.txt
+pip install .
+```
+
+Or if you want to install it in editable mode for development:
+
+```bash
+pip install -e .
+```
+
+You can also install it directly from GitHub (if hosted there):
+
+```bash
+pip install git+https://github.com/grossrc/NiimbotB1_Simple_Print.git
 ```
 
 ## Configuration Options

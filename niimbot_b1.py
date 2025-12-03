@@ -5,12 +5,18 @@ A clean implementation based on the protocol documentation at:
 https://printers.niim.blue/interfacing/proto/
 https://printers.niim.blue/interfacing/print-tasks/
 
+
+Documentation for this Project:
+https://github.com/grossrc/NiimbotB1_Simple_Print
+
 B1 Specifications:
 - DPI: 203
 - Printhead size: 48mm (384px)
 - Paper types: 1 (Gap), 2 (Black), 5 (Transparent)
 - Density range: 1-5 (default 3)
 """
+
+__version__ = "0.1.0"
 
 import asyncio
 import struct

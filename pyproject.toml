@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "niimbot-b1-simple"
+version = "0.1.0"
+description = "A clean implementation for NiimBot B1 Printer"
+readme = "README.md"
+requires-python = ">=3.7"
+license = {text = "MIT"}
+authors = [
+    {name = "grossrc"},
+    {name = "Gemeni 3 Pro"},
+    {name = "Your mother"}
+]
+dependencies = [
+    "bleak>=0.21.0",
+    "Pillow>=10.0.0"
+]
+
+[tool.setuptools]
+py-modules = ["niimbot_b1"]
