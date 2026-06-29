@@ -21,6 +21,13 @@ __version__ = "0.1.0"
 import asyncio
 import struct
 import math
+import os
+import sys
+import time
+import queue
+import tempfile
+import subprocess
+import multiprocessing
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Optional, Callable
@@ -203,6 +210,11 @@ class NiimbotB1:
     # -------------------------------------------------------------------------
     # Connection Management
     # -------------------------------------------------------------------------
+    
+    @property
+    def is_connected(self) -> bool:
+        """True if the underlying BLE client is currently connected."""
+        return self.client is not None and self.client.is_connected
     
     async def connect(self):
         """Connect to the printer via BLE"""
@@ -698,20 +710,537 @@ class NiimbotB1:
 # Helper Functions
 # ============================================================================
 
-async def discover_printer() -> Optional[str]:
-    """Scan for NiimBot printers and return the address"""
+async def discover_printer(timeout: float = 5.0, adapter: Optional[str] = None) -> Optional[str]:
+    """Scan for NiimBot printers and return the address.
+
+    On Linux you may pass ``adapter`` (e.g. ``"hci0"``) to select a specific
+    Bluetooth controller. The argument is ignored on platforms where the BLE
+    backend does not support it.
+    """
     print("Scanning for NiimBot printers...")
-    
-    devices = await BleakScanner.discover(timeout=5.0)
-    
+
+    scan_kwargs = {"timeout": timeout}
+    if adapter and _is_linux():
+        scan_kwargs["adapter"] = adapter
+
+    try:
+        devices = await BleakScanner.discover(**scan_kwargs)
+    except TypeError:
+        # Backend does not accept the adapter kwarg; retry without it.
+        devices = await BleakScanner.discover(timeout=timeout)
+
     for device in devices:
         name = device.name or ""
         if "NIIMBOT" in name.upper() or "B1" in name.upper():
             print(f"Found: {device.name} ({device.address})")
             return device.address
-    
+
     print("No NiimBot printer found")
     return None
+
+
+# ============================================================================
+# Linux Bluetooth Adapter Readiness
+# ============================================================================
+
+def _is_linux() -> bool:
+    """True when running on a Linux host (e.g. Raspberry Pi)."""
+    return sys.platform.startswith("linux")
+
+
+def ensure_bluetooth_ready(
+    adapter: str = "hci0",
+    retries: int = 3,
+    delay: float = 1.0,
+    debug: bool = True,
+) -> bool:
+    """Bring the local Bluetooth adapter into a usable state (Linux only).
+
+    On Linux/BlueZ the adapter is frequently soft-blocked or powered down,
+    which makes BLE discovery and connection fail before they even start.
+    This helper:
+
+      1. Runs ``rfkill unblock bluetooth`` to clear soft blocks.
+      2. Runs ``bluetoothctl power on`` for the adapter.
+      3. Retries power-on when BlueZ reports the transient
+         ``org.bluez.Error.Busy`` that can occur during power-up.
+
+    Returns ``True`` if the adapter appears ready (always ``True`` on
+    non-Linux platforms, where this is a no-op).
+    """
+    if not _is_linux():
+        return True
+
+    def _log(msg: str):
+        if debug:
+            print(f"[bluetooth] {msg}")
+
+    # 1. Clear any RF soft block.
+    try:
+        subprocess.run(
+            ["rfkill", "unblock", "bluetooth"],
+            check=False, capture_output=True, text=True, timeout=10,
+        )
+    except FileNotFoundError:
+        _log("rfkill not found; skipping unblock")
+    except subprocess.TimeoutExpired:
+        _log("rfkill timed out; continuing")
+
+    # 2/3. Power the adapter on, retrying on transient Busy errors.
+    for attempt in range(1, retries + 1):
+        try:
+            result = subprocess.run(
+                ["bluetoothctl", "--", "power", "on"],
+                check=False, capture_output=True, text=True, timeout=10,
+            )
+        except FileNotFoundError:
+            _log("bluetoothctl not found; cannot manage adapter power")
+            return False
+        except subprocess.TimeoutExpired:
+            _log(f"bluetoothctl timed out (attempt {attempt}/{retries})")
+            time.sleep(delay)
+            continue
+
+        out = (result.stdout + result.stderr).lower()
+
+        if "succeeded" in out or ("changing power on" in out and "fail" not in out):
+            _log(f"adapter {adapter} powered on")
+            return True
+
+        if "org.bluez.error.busy" in out or "busy" in out:
+            _log(f"adapter busy, retrying in {delay}s (attempt {attempt}/{retries})")
+            time.sleep(delay)
+            continue
+
+        # Some BlueZ versions print nothing useful but still succeed.
+        if result.returncode == 0:
+            _log(f"adapter {adapter} power-on returned success")
+            return True
+
+        _log(f"power-on attempt {attempt}/{retries} failed: {out.strip() or 'unknown error'}")
+        time.sleep(delay)
+
+    _log(f"adapter {adapter} could not be powered on after {retries} attempts")
+    return False
+
+
+# ============================================================================
+# Printer Address Cache
+# ============================================================================
+
+def _default_cache_path() -> str:
+    """Path of the file used to cache the last-known printer address."""
+    return os.path.join(tempfile.gettempdir(), "niimbot_b1_address.txt")
+
+
+def load_cached_address(path: Optional[str] = None) -> Optional[str]:
+    """Return the cached printer address, or ``None`` if not cached."""
+    path = path or _default_cache_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            addr = f.read().strip()
+            return addr or None
+    except OSError:
+        return None
+
+
+def save_cached_address(address: str, path: Optional[str] = None) -> None:
+    """Persist the printer address for faster reconnects."""
+    path = path or _default_cache_path()
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(address)
+    except OSError:
+        pass
+
+
+def clear_cached_address(path: Optional[str] = None) -> None:
+    """Remove the cached printer address.
+
+    Call this after a connection failure so the next connect forces a fresh
+    discovery instead of reusing a stale BLE address.
+    """
+    path = path or _default_cache_path()
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+# ============================================================================
+# Persistent Session Manager
+# ============================================================================
+
+class PrinterSession:
+    """High-level persistent connection manager for the NiimBot B1.
+
+    Unlike the ``async with NiimbotB1(...)`` pattern (which connects and
+    disconnects around a single job), a ``PrinterSession`` connects once and
+    stays connected so you can print many jobs before disconnecting. It adds
+    the production hardening needed on Linux/Raspberry Pi deployments:
+
+      * Bluetooth adapter readiness checks before connecting.
+      * Address discovery with an on-disk cache.
+      * Automatic cache invalidation + rediscovery after a failure.
+      * Reconnect-and-retry around print jobs.
+
+    Example::
+
+        session = PrinterSession(adapter="hci0")
+        await session.connect()
+        await session.print_image("a.png")
+        await session.print_image("b.png")
+        await session.disconnect()
+    """
+
+    def __init__(
+        self,
+        address: Optional[str] = None,
+        density: int = 3,
+        label_type: LabelType = LabelType.WITH_GAPS,
+        adapter: str = "hci0",
+        prepare_adapter: bool = True,
+        max_reconnect_attempts: int = 2,
+        scan_timeout: float = 5.0,
+        cache_path: Optional[str] = None,
+        debug: bool = True,
+    ):
+        self.address = address
+        self.density = density
+        self.label_type = label_type
+        self.adapter = adapter
+        self.prepare_adapter = prepare_adapter
+        self.max_reconnect_attempts = max(0, max_reconnect_attempts)
+        self.scan_timeout = scan_timeout
+        self.cache_path = cache_path
+        self.debug = debug
+
+        self._printer: Optional[NiimbotB1] = None
+
+    # -- context manager ------------------------------------------------------
+
+    async def __aenter__(self):
+        await self.connect()
+        return self
+
+    async def __aexit__(self, *args):
+        await self.disconnect()
+
+    # -- state ----------------------------------------------------------------
+
+    @property
+    def is_connected(self) -> bool:
+        return self._printer is not None and self._printer.is_connected
+
+    def _log(self, message: str):
+        if self.debug:
+            print(f"[PrinterSession] {message}")
+
+    # -- address resolution ---------------------------------------------------
+
+    async def _resolve_address(self, force_rediscover: bool = False) -> Optional[str]:
+        if self.address and not force_rediscover:
+            return self.address
+
+        if not force_rediscover:
+            cached = load_cached_address(self.cache_path)
+            if cached:
+                self._log(f"Using cached address {cached}")
+                return cached
+
+        addr = await discover_printer(
+            timeout=self.scan_timeout,
+            adapter=self.adapter,
+        )
+        if addr:
+            save_cached_address(addr, self.cache_path)
+        return addr
+
+    def _invalidate_address(self):
+        """Drop the cached address so the next connect rediscovers."""
+        self._log("Invalidating cached printer address")
+        clear_cached_address(self.cache_path)
+
+    # -- connection -----------------------------------------------------------
+
+    async def connect(self):
+        """Connect to the printer, preparing the adapter and discovering as needed."""
+        if self.is_connected:
+            return
+
+        if self.prepare_adapter:
+            ensure_bluetooth_ready(self.adapter, debug=self.debug)
+
+        last_error: Optional[Exception] = None
+        attempts = self.max_reconnect_attempts + 1
+
+        for attempt in range(1, attempts + 1):
+            # On retries, force a fresh discovery because a stale address is a
+            # common cause of repeated connection failures.
+            force = attempt > 1
+            address = await self._resolve_address(force_rediscover=force)
+            if not address:
+                last_error = RuntimeError("No NiimBot printer found")
+                self._log(f"Discovery failed (attempt {attempt}/{attempts})")
+                continue
+
+            try:
+                self._log(f"Connecting to {address} (attempt {attempt}/{attempts})")
+                self._printer = NiimbotB1(address, self.density, self.label_type)
+                await self._printer.connect()
+                return
+            except Exception as exc:  # bleak raises various BLE/OS errors
+                last_error = exc
+                self._log(f"Connection failed: {exc}")
+                await self._safe_disconnect()
+                self._invalidate_address()
+
+        raise RuntimeError(f"Could not connect to printer: {last_error}")
+
+    async def _safe_disconnect(self):
+        if self._printer is not None:
+            try:
+                await self._printer.disconnect()
+            except Exception:
+                pass
+            self._printer = None
+
+    async def disconnect(self):
+        """Disconnect from the printer and release the BLE client."""
+        await self._safe_disconnect()
+
+    async def ensure_connected(self):
+        """Reconnect if the connection has dropped."""
+        if not self.is_connected:
+            self._log("Connection lost; reconnecting...")
+            await self._safe_disconnect()
+            await self.connect()
+
+    # -- operations (with reconnect/retry) ------------------------------------
+
+    async def print_image(self, image_path: str, copies: int = 1) -> bool:
+        """Print an image, reconnecting once if the connection has dropped."""
+        attempts = self.max_reconnect_attempts + 1
+        last_error: Optional[Exception] = None
+
+        for attempt in range(1, attempts + 1):
+            try:
+                await self.ensure_connected()
+                return await self._printer.print_image(image_path, copies)
+            except Exception as exc:
+                last_error = exc
+                self._log(f"Print failed (attempt {attempt}/{attempts}): {exc}")
+                await self._safe_disconnect()
+                self._invalidate_address()
+
+        raise RuntimeError(f"Print failed: {last_error}")
+
+    async def get_battery(self) -> Optional[int]:
+        await self.ensure_connected()
+        return await self._printer.get_battery()
+
+    async def calibrate(self) -> bool:
+        await self.ensure_connected()
+        return await self._printer.calibrate()
+
+    async def get_rfid(self) -> Optional[dict]:
+        await self.ensure_connected()
+        return await self._printer.get_rfid()
+
+
+# ============================================================================
+# Subprocess-Isolated Worker (gevent / eventlet safe)
+# ============================================================================
+#
+# BLE printing needs a clean asyncio event loop. Inside a gevent- or
+# eventlet-monkeypatched process (e.g. Flask-SocketIO), asyncio and bleak can
+# misbehave. The robust fix is to run all printer operations in a separate
+# process that has its own untouched interpreter and event loop. PrinterWorker
+# does exactly that, exposing a simple *synchronous* API to the parent.
+
+def _worker_main(cmd_q, res_q, config):
+    """Entry point for the worker process (must be importable for spawn)."""
+    try:
+        asyncio.run(_worker_loop(cmd_q, res_q, config))
+    except Exception as exc:  # pragma: no cover - last-resort guard
+        try:
+            res_q.put({"ok": False, "error": f"worker crashed: {exc}"})
+        except Exception:
+            pass
+
+
+async def _worker_loop(cmd_q, res_q, config):
+    session = PrinterSession(**config)
+    loop = asyncio.get_event_loop()
+
+    while True:
+        # Block in a thread so the asyncio loop stays responsive.
+        cmd = await loop.run_in_executor(None, cmd_q.get)
+        action = cmd.get("action")
+
+        try:
+            if action == "shutdown":
+                await session.disconnect()
+                res_q.put({"ok": True, "result": None})
+                break
+            elif action == "connect":
+                await session.connect()
+                res_q.put({"ok": True, "result": None})
+            elif action == "disconnect":
+                await session.disconnect()
+                res_q.put({"ok": True, "result": None})
+            elif action == "print_image":
+                result = await session.print_image(cmd["path"], cmd.get("copies", 1))
+                res_q.put({"ok": True, "result": result})
+            elif action == "get_battery":
+                res_q.put({"ok": True, "result": await session.get_battery()})
+            elif action == "calibrate":
+                res_q.put({"ok": True, "result": await session.calibrate()})
+            elif action == "get_rfid":
+                res_q.put({"ok": True, "result": await session.get_rfid()})
+            elif action == "is_connected":
+                res_q.put({"ok": True, "result": session.is_connected})
+            else:
+                res_q.put({"ok": False, "error": f"unknown action: {action}"})
+        except Exception as exc:
+            res_q.put({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+
+
+class PrinterWorker:
+    """Run printer operations in an isolated subprocess with a clean event loop.
+
+    This is the recommended way to drive the printer from a gevent/eventlet
+    server (Flask-SocketIO). The worker keeps a persistent connection across
+    jobs; call :meth:`connect` once, then :meth:`print_image` as many times as
+    needed, and :meth:`shutdown` (or let the process exit) to disconnect.
+
+    Example::
+
+        worker = PrinterWorker(adapter="hci0")
+        worker.start()
+        worker.connect()
+        worker.print_image("a.png")
+        worker.print_image("b.png")
+        worker.shutdown()
+    """
+
+    def __init__(
+        self,
+        address: Optional[str] = None,
+        density: int = 3,
+        label_type: LabelType = LabelType.WITH_GAPS,
+        adapter: str = "hci0",
+        prepare_adapter: bool = True,
+        max_reconnect_attempts: int = 2,
+        scan_timeout: float = 5.0,
+        cache_path: Optional[str] = None,
+        debug: bool = True,
+        call_timeout: float = 120.0,
+    ):
+        self._config = {
+            "address": address,
+            "density": density,
+            "label_type": label_type,
+            "adapter": adapter,
+            "prepare_adapter": prepare_adapter,
+            "max_reconnect_attempts": max_reconnect_attempts,
+            "scan_timeout": scan_timeout,
+            "cache_path": cache_path,
+            "debug": debug,
+        }
+        self.call_timeout = call_timeout
+
+        # "spawn" gives the child a fresh interpreter that is NOT affected by
+        # any gevent/eventlet monkeypatching applied in the parent process.
+        self._ctx = multiprocessing.get_context("spawn")
+        self._cmd_q = None
+        self._res_q = None
+        self._proc = None
+
+    # -- lifecycle ------------------------------------------------------------
+
+    def start(self):
+        """Spawn the worker process."""
+        if self._proc is not None and self._proc.is_alive():
+            return
+        self._cmd_q = self._ctx.Queue()
+        self._res_q = self._ctx.Queue()
+        self._proc = self._ctx.Process(
+            target=_worker_main,
+            args=(self._cmd_q, self._res_q, self._config),
+            daemon=True,
+        )
+        self._proc.start()
+
+    @property
+    def is_alive(self) -> bool:
+        return self._proc is not None and self._proc.is_alive()
+
+    def _call(self, action: str, timeout: Optional[float] = None, **kwargs):
+        if not self.is_alive:
+            raise RuntimeError("Printer worker is not running; call start() first")
+
+        self._cmd_q.put({"action": action, **kwargs})
+
+        deadline = time.monotonic() + (timeout if timeout is not None else self.call_timeout)
+        while True:
+            try:
+                # Short timeout so this poll cooperates with gevent (which
+                # patches select) and lets other greenlets run.
+                response = self._res_q.get(timeout=0.1)
+                break
+            except queue.Empty:
+                if not self.is_alive:
+                    raise RuntimeError("Printer worker process died unexpectedly")
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"Timed out waiting for '{action}'")
+
+        if not response.get("ok"):
+            raise RuntimeError(response.get("error", "unknown worker error"))
+        return response.get("result")
+
+    # -- synchronous API ------------------------------------------------------
+
+    def connect(self):
+        return self._call("connect")
+
+    def disconnect(self):
+        return self._call("disconnect")
+
+    def print_image(self, image_path: str, copies: int = 1) -> bool:
+        return self._call("print_image", path=image_path, copies=copies)
+
+    def get_battery(self) -> Optional[int]:
+        return self._call("get_battery")
+
+    def calibrate(self) -> bool:
+        return self._call("calibrate")
+
+    def get_rfid(self) -> Optional[dict]:
+        return self._call("get_rfid")
+
+    def is_printer_connected(self) -> bool:
+        return self._call("is_connected", timeout=10.0)
+
+    def shutdown(self, timeout: float = 15.0):
+        """Disconnect the printer and stop the worker process."""
+        if self.is_alive:
+            try:
+                self._call("shutdown", timeout=timeout)
+            except Exception:
+                pass
+            self._proc.join(timeout=5.0)
+            if self._proc.is_alive():
+                self._proc.terminate()
+        self._proc = None
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, *args):
+        self.shutdown()
+
 
 
 def create_test_image(path: str, width: int = 384, height: int = 240, text: str = "TEST"):

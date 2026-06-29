@@ -52,6 +52,84 @@ NiimbotB1(
 | `calibrate()` | Calibrate label sensor (run after changing rolls) |
 | `get_print_status()` | Get current print status |
 
+## Persistent Connections & Production Deployment
+
+The basic `async with NiimbotB1(...)` pattern connects and disconnects around a
+single job. For real deployments (e.g. a Raspberry Pi print server) you usually
+want to **connect once, print many jobs, then disconnect manually or by powering
+off**. Two higher-level helpers are provided for this.
+
+### `PrinterSession` — stay connected across jobs
+
+`PrinterSession` keeps a single BLE connection alive and adds the hardening
+needed on Linux/BlueZ:
+
+- **Adapter readiness** — runs `rfkill unblock bluetooth` and `bluetoothctl power on` before connecting.
+- **`org.bluez.Error.Busy` handling** — retries adapter power-on after a short delay.
+- **Address caching** — caches the discovered address on disk for fast reconnects.
+- **Cache invalidation** — clears the cached address and forces rediscovery after a connection failure.
+- **Reconnect/retry** — automatically reconnects if the link drops between jobs.
+
+```python
+from niimbot_b1 import PrinterSession
+import asyncio
+
+async def main():
+    session = PrinterSession(adapter="hci0")
+    await session.connect()              # connect once
+    try:
+        await session.print_image("label1.png")
+        await session.print_image("label2.png")   # reuses the live connection
+    finally:
+        await session.disconnect()        # or just power off the printer
+
+asyncio.run(main())
+```
+
+### `PrinterWorker` — subprocess isolation for gevent / Flask-SocketIO
+
+BLE printing requires a clean `asyncio` event loop. Inside a gevent- or
+eventlet-monkeypatched process (such as a Flask-SocketIO server), `asyncio` and
+`bleak` can misbehave. `PrinterWorker` runs **all** printer operations in a
+separate process (spawned with a fresh, unpatched interpreter) and exposes a
+simple synchronous API. The connection stays alive across jobs.
+
+```python
+from niimbot_b1 import PrinterWorker
+
+worker = PrinterWorker(adapter="hci0")
+worker.start()       # spawn the isolated process
+worker.connect()     # connect once
+worker.print_image("label1.png")
+worker.print_image("label2.png")
+worker.shutdown()    # disconnect + stop the process
+```
+
+Flask-SocketIO sketch — one worker for the app's lifetime:
+
+```python
+from niimbot_b1 import PrinterWorker
+import atexit
+
+printer = PrinterWorker(adapter="hci0")
+printer.start()
+printer.connect()
+
+@socketio.on("print")
+def handle_print(data):
+    printer.print_image(data["path"])   # reuses the live connection
+
+atexit.register(printer.shutdown)
+```
+
+### Helper functions
+
+| Function | Description |
+|----------|-------------|
+| `ensure_bluetooth_ready(adapter="hci0")` | Unblock + power on the Linux adapter (no-op off Linux) |
+| `clear_cached_address()` | Drop the cached BLE address to force rediscovery |
+| `load_cached_address()` / `save_cached_address(addr)` | Read/write the address cache |
+
 ## Finding Your Printer
 
 ```python
